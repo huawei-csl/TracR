@@ -45,7 +45,8 @@ inline thread_local std::unique_ptr<TraCRThread> tracrThread;
 
 /**
  * Global variable to check if TraCR tracing is enabled (at runtime)
- * Doesn't have to be atomic as slipping some traces is not dramatic.
+ * Intentionally non-atomic: slipping a trace on a concurrent on/off toggle
+ * is acceptable, and a plain bool avoids any compiler or hardware overhead.
  */
 inline bool enable_tracr{true};
 
@@ -229,7 +230,7 @@ static inline std::string instrumentation_get_thread_trace_str() {
 /**
  * Marker add method
  *
- * NOTE: This is note thread safe! Should be called by one thread.
+ * NOTE: This is not thread safe! Should be called by one thread.
  *
  * \param[in] label
  * \param[in] colorId
@@ -237,22 +238,23 @@ static inline std::string instrumentation_get_thread_trace_str() {
  * @return the eventId of this marker
  */
 static inline uint16_t
-instrumentation_mark_w_color_add(const std::string &label,
-                                 const uint16_t &colorId) {
+instrumentation_mark_w_color_add(const std::string &label, uint16_t colorId) {
   if (tracrProc->_markerTypes.count(colorId)) {
     std::cerr << "This color has already been used. Choose another one.\n";
     std::exit(EXIT_FAILURE);
   }
 
   tracrProc->_markerTypes[colorId] = label;
+  tracrProc->_markerLabels.push_back(label);
+  tracrProc->_markerColorIds.push_back(colorId);
 
-  return tracrProc->_markerTypes.size() - 1;
+  return static_cast<uint16_t>(tracrProc->_markerLabels.size() - 1);
 }
 
 /**
  * Lazy marker add method. I.e. one doesn't have to provide the color idx
  *
- * NOTE: This is note thread safe! Should be called by one thread.
+ * NOTE: This is not thread safe! Should be called by one thread.
  *
  * \param[in] label
  *
@@ -266,17 +268,19 @@ static inline uint16_t instrumentation_mark_add(const std::string &label) {
   }
 
   tracrProc->_markerTypes[colorId] = label;
+  tracrProc->_markerLabels.push_back(label);
+  tracrProc->_markerColorIds.push_back(colorId);
 
-  return tracrProc->_markerTypes.size() - 1;
+  return static_cast<uint16_t>(tracrProc->_markerLabels.size() - 1);
 }
 
 /**
  *
  */
-static inline void
-instrumentation_mark_set(const uint16_t &channelId, const uint16_t &eventId,
-                         const uint32_t &extraId = UINT32_MAX) {
-  if (unlikely(!enable_tracr))
+static inline void instrumentation_mark_set(uint16_t channelId,
+                                             uint16_t eventId,
+                                             uint32_t extraId = UINT32_MAX) {
+  if (TRACR_UNLIKELY(!enable_tracr))
     return;
 
   Payload payload{channelId, eventId, extraId, NanoTimer::now()};
@@ -287,8 +291,8 @@ instrumentation_mark_set(const uint16_t &channelId, const uint16_t &eventId,
 /**
  *
  */
-static inline void instrumentation_mark_reset(const uint16_t &channelId) {
-  if (unlikely(!enable_tracr))
+static inline void instrumentation_mark_reset(uint16_t channelId) {
+  if (TRACR_UNLIKELY(!enable_tracr))
     return;
 
   Payload payload{channelId, UINT16_MAX, UINT32_MAX, NanoTimer::now()};

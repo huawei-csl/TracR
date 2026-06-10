@@ -25,25 +25,29 @@
 
 #include <array>
 #include <atomic>
+#include <cstring>
 #include <ctime>
-#include <fstream> // To store files
+#include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <nlohmann/json.hpp>
-#include <sched.h> // sched_getcpu()
+#include <sched.h>
+#include <sstream>
 #include <string>
-#include <sys/stat.h>  // mkdir()
-#include <sys/types.h> // chmod type
-#include <unistd.h>    // SYS_gettid
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <unistd.h>
 #include <unordered_map>
+#include <vector>
 
 namespace TraCR {
 
 /**
- * Compiler hint macors for skewed branch prediction
+ * Compiler hint macros for skewed branch prediction.
+ * Prefixed TRACR_ to avoid collisions with system headers (GLib, Linux kernel).
  */
-#define likely(x) __builtin_expect(!!(x), 1)
-#define unlikely(x) __builtin_expect(!!(x), 0)
+#define TRACR_LIKELY(x)   __builtin_expect(!!(x), 1)
+#define TRACR_UNLIKELY(x) __builtin_expect(!!(x), 0)
 
 /**
  * The maximum capacity of one tracr thread for capturing the traces.
@@ -126,7 +130,10 @@ private:
 #ifdef USE_HW_COUNTER
   static inline uint64_t ticks_to_ns(uint64_t ticks) {
     static const uint64_t freq = frequency();
-    return (ticks * 1'000'000'000ULL) / freq;
+    // Split to avoid overflow: (ticks * 1e9) / freq overflows for runs > ~6s
+    // at 3 GHz. Divide first, then handle the remainder separately.
+    return (ticks / freq) * 1'000'000'000ULL
+         + (ticks % freq) * 1'000'000'000ULL / freq;
   }
 #endif
 
@@ -160,7 +167,7 @@ struct Payload {
   // channelId defines in which channel this payload has to be set [0, 65535]
   uint16_t channelId;
 
-  // eventId defines the type of even (i.e. the color) [0, 65535]
+  // eventId defines the type of event (i.e. the color) [0, 65535]
   uint16_t eventId;
 
   // extraId consists of an extra information that has been added to be stored
@@ -170,9 +177,10 @@ struct Payload {
   // Chrono nanosecond timestamp
   uint64_t timestamp;
 };
+static_assert(sizeof(Payload) == 16, "Payload must be exactly 16 bytes");
 
 /**
- * TraCR Thread class. One MPI instance chas atleast 1
+ * TraCR Thread class. One MPI instance has at least 1
  */
 class TraCRThread {
 public:
@@ -196,7 +204,7 @@ public:
    */
   inline void store_trace(const Payload &payload) {
 #ifdef TRACR_POLICY_PERIODIC
-    if (unlikely(_traceIdx == CAPACITY)) {
+    if (TRACR_UNLIKELY(_traceIdx == CAPACITY)) {
       debug_print("WARNING: TID[%lu] is full, this thread will now overwrite "
                   "from the beginning.",
                   _tid);
@@ -206,7 +214,7 @@ public:
     ++_traceIdx;
 
 #elif defined(TRACR_POLICY_IGNORE_IF_FULL)
-    if (unlikely(_traceIdx >= CAPACITY)) {
+    if (TRACR_UNLIKELY(_traceIdx >= CAPACITY)) {
       debug_print("WARNING: TID[%lu] is full, this thread will now ignore "
                   "incoming traces.",
                   _tid);
@@ -215,7 +223,7 @@ public:
       ++_traceIdx;
     }
 #else /* Abort if full */
-    if (unlikely(_traceIdx >= CAPACITY)) {
+    if (TRACR_UNLIKELY(_traceIdx >= CAPACITY)) {
       std::cerr << "Warning: TID[" << _tid
                 << "] is full, terminating with a Runtime Error.\n";
       std::exit(EXIT_FAILURE);
@@ -227,28 +235,27 @@ public:
   }
 
   /**
-   * Flushed the traces into a file at the given path
+   * Flushes the traces into a file at the given path
    */
 #ifndef TRACR_DISABLE_FLUSH
   inline void flush_traces(const std::string &path) {
     // Don't create a folder if this TraCR thread is empty
-    if (_traceIdx == 0) {
+    if (_traceIdx == 0)
       return;
-    }
 
-    _thread_folder_name = path + "thread." + std::to_string(_tid) + "/";
+    std::string thread_folder = path + "thread." + std::to_string(_tid) + "/";
 
-    // Create the last thread ID folder
-    if (mkdir(_thread_folder_name.c_str(), 0755) != 0) {
+    // Create the thread ID folder
+    if (mkdir(thread_folder.c_str(), 0755) != 0) {
       if (errno != EEXIST) { // ignore "already exists"
-        std::cerr << "mkdir failed for: " << _thread_folder_name
+        std::cerr << "mkdir failed for: " << thread_folder
                   << " errno=" << errno << " (" << std::strerror(errno)
                   << ")\n";
         std::exit(EXIT_FAILURE);
       }
     }
 
-    std::string filepath = _thread_folder_name + "traces.bts";
+    std::string filepath = thread_folder + "traces.bts";
 
     debug_print("The filepath of this TraCR thread[%lu] is: %s", _tid,
                 filepath.c_str());
@@ -259,9 +266,22 @@ public:
       std::exit(EXIT_FAILURE);
     }
 
-    // Write raw memory
+#ifdef TRACR_POLICY_PERIODIC
+    if (_traceIdx > CAPACITY) {
+      // Ring buffer has wrapped: write in temporal order (oldest entry first)
+      size_t oldest = _traceIdx % CAPACITY;
+      ofs.write(reinterpret_cast<const char *>(_traces.data() + oldest),
+                sizeof(Payload) * (CAPACITY - oldest));
+      ofs.write(reinterpret_cast<const char *>(_traces.data()),
+                sizeof(Payload) * oldest);
+    } else {
+      ofs.write(reinterpret_cast<const char *>(_traces.data()),
+                sizeof(Payload) * _traceIdx);
+    }
+#else
     ofs.write(reinterpret_cast<const char *>(_traces.data()),
               sizeof(Payload) * _traceIdx);
+#endif
 
     if (!ofs.good()) {
       std::cerr << "Failed to write into file: " << filepath << "\n";
@@ -292,13 +312,10 @@ public:
 private:
   // kernel thread ID
   long _tid;
-
-  // The path of the thread folder
-  std::string _thread_folder_name;
 };
 
 /**
- * TraCR Proc class, each MPI instance can how one.
+ * TraCR Proc class, each MPI instance can have one.
  */
 class TraCRProc {
 public:
@@ -359,7 +376,7 @@ public:
   /**
    *
    */
-  inline std::string getFolderPath() { return _proc_folder_name; }
+  inline const std::string &getFolderPath() const { return _proc_folder_name; }
 
   /**
    *
@@ -399,7 +416,7 @@ public:
   /**
    *
    */
-  inline void addNumberOfChannels(const u_int16_t num_channels) {
+  inline void addNumberOfChannels(uint16_t num_channels) {
     _json_file["num_channels"] = num_channels;
   }
 
@@ -410,6 +427,12 @@ public:
     _json_file["pid"] = _lCPUid;
     _json_file["start_time"] = _tracr_init_time;
 
+    // Labels and colorIds indexed by eventId (insertion order).
+    // These are the authoritative source for postprocessor label lookup.
+    _json_file["markerLabels"]   = _markerLabels;
+    _json_file["markerColorIds"] = _markerColorIds;
+
+    // colorId -> label mapping kept for Paraver PCF generation
     for (const auto &[key, value] : _markerTypes) {
       _json_file["markerTypes"][std::to_string(key)] = value;
     }
@@ -422,10 +445,16 @@ public:
    */
   inline long getTID() { return _tid; }
 
-  // The dynamic list to store all the marker types created
+  // colorId -> label, used for Paraver PCF
   std::unordered_map<uint16_t, std::string> _markerTypes;
 
-  // Metadata and channel informations of this system
+  // Labels indexed by eventId (insertion order) - for Perfetto and Paraver PRV
+  std::vector<std::string> _markerLabels;
+
+  // Paraver colorIds indexed by eventId - maps eventId -> colorId for PRV file
+  std::vector<uint16_t> _markerColorIds;
+
+  // Metadata and channel information of this system
   nlohmann::json _json_file;
 
 private:

@@ -384,24 +384,24 @@ void extract_channel_info(const nlohmann::json &metadata, size_t &num_channels,
 }
 
 /**
- *
+ * Returns colorId strings indexed by eventId for writing to the Paraver PRV
+ * file. Reads the authoritative markerColorIds array when available, with
+ * fallback to the legacy markerTypes key iteration for old traces.
  */
-std::vector<std::string> extract_marker_keys(const nlohmann::json &metadata) {
-  std::vector<std::string> markerTypes_keys;
+std::vector<std::string> extract_marker_color_ids(const nlohmann::json &metadata) {
+  std::vector<std::string> color_ids;
 
-  const nlohmann::json *marker_json = nullptr;
-
-  if (metadata.contains("markerTypes") && !metadata["markerTypes"].is_null()) {
-    marker_json = &metadata["markerTypes"];
+  if (metadata.contains("markerColorIds") &&
+      !metadata["markerColorIds"].is_null()) {
+    for (auto &id : metadata["markerColorIds"])
+      color_ids.push_back(std::to_string(uint16_t(id)));
+  } else if (metadata.contains("markerTypes") &&
+             !metadata["markerTypes"].is_null()) {
+    for (auto &[key, value] : metadata["markerTypes"].items())
+      color_ids.push_back(key);
   }
 
-  if (marker_json) {
-    for (auto &[key, value] : marker_json->items()) {
-      markerTypes_keys.push_back(key);
-    }
-  }
-
-  return markerTypes_keys;
+  return color_ids;
 }
 
 /**
@@ -429,7 +429,7 @@ int create_tracr_prv(const fs::path &base_path, const nlohmann::json &metadata,
       << std::setw(2) << std::setfill('0') << local_tm->tm_min
       << "):00000000000000000000_ns:0:1:1(" << num_channels << ":1)\n";
 
-  std::vector<std::string> markerTypes_keys = extract_marker_keys(metadata);
+  std::vector<std::string> markerColorIds = extract_marker_color_ids(metadata);
 
   bool first = true;
   uint64_t start_time = 0;
@@ -445,10 +445,10 @@ int create_tracr_prv(const fs::path &base_path, const nlohmann::json &metadata,
 
     std::string colorId;
 
-    if (!markerTypes_keys.empty()) {
+    if (!markerColorIds.empty()) {
       colorId = (payload.eventId == UINT16_MAX)
                     ? "0"
-                    : markerTypes_keys[payload.eventId];
+                    : markerColorIds[payload.eventId];
     } else {
       colorId = (payload.eventId == UINT16_MAX)
                     ? "0"
@@ -569,11 +569,16 @@ int perfetto(const std::vector<std::vector<TraCR::Payload>> &bts_files,
            !metadata["num_channels"].is_null())
     num_channels = metadata["num_channels"];
 
-  // Extract marker type labels for event name lookup
-  std::vector<std::string> markerTypes_values;
-  if (metadata.contains("markerTypes") && !metadata["markerTypes"].is_null())
+  // Extract marker labels indexed by eventId.
+  // Prefer markerLabels array (correct insertion order); fall back to
+  // markerTypes key iteration for traces produced by older library versions.
+  std::vector<std::string> markerLabels;
+  if (metadata.contains("markerLabels") && !metadata["markerLabels"].is_null())
+    for (auto &label : metadata["markerLabels"])
+      markerLabels.push_back(label);
+  else if (metadata.contains("markerTypes") && !metadata["markerTypes"].is_null())
     for (auto &[key, value] : metadata["markerTypes"].items())
-      markerTypes_values.push_back(value);
+      markerLabels.push_back(value);
 
   std::ofstream out(base_path / "perfetto.json");
   if (!out.is_open()) {
@@ -620,8 +625,8 @@ int perfetto(const std::vector<std::vector<TraCR::Payload>> &bts_files,
 
     if (prev_payloads[channelId].eventId != UINT16_MAX) {
       const TraCR::Payload &prev = prev_payloads[channelId];
-      std::string mType = (!markerTypes_values.empty())
-                              ? markerTypes_values[prev.eventId]
+      std::string mType = (!markerLabels.empty())
+                              ? markerLabels[prev.eventId]
                               : std::to_string(prev.eventId);
 
       out << ",\n{\"name\":" << json_str(mType)
