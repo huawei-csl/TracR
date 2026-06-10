@@ -46,7 +46,7 @@ namespace TraCR {
  * Compiler hint macros for skewed branch prediction.
  * Prefixed TRACR_ to avoid collisions with system headers (GLib, Linux kernel).
  */
-#define TRACR_LIKELY(x)   __builtin_expect(!!(x), 1)
+#define TRACR_LIKELY(x) __builtin_expect(!!(x), 1)
 #define TRACR_UNLIKELY(x) __builtin_expect(!!(x), 0)
 
 /**
@@ -132,8 +132,8 @@ private:
     static const uint64_t freq = frequency();
     // Split to avoid overflow: (ticks * 1e9) / freq overflows for runs > ~6s
     // at 3 GHz. Divide first, then handle the remainder separately.
-    return (ticks / freq) * 1'000'000'000ULL
-         + (ticks % freq) * 1'000'000'000ULL / freq;
+    return (ticks / freq) * 1'000'000'000ULL +
+           (ticks % freq) * 1'000'000'000ULL / freq;
   }
 #endif
 
@@ -248,9 +248,8 @@ public:
     // Create the thread ID folder
     if (mkdir(thread_folder.c_str(), 0755) != 0) {
       if (errno != EEXIST) { // ignore "already exists"
-        std::cerr << "mkdir failed for: " << thread_folder
-                  << " errno=" << errno << " (" << std::strerror(errno)
-                  << ")\n";
+        std::cerr << "mkdir failed for: " << thread_folder << " errno=" << errno
+                  << " (" << std::strerror(errno) << ")\n";
         std::exit(EXIT_FAILURE);
       }
     }
@@ -429,7 +428,7 @@ public:
 
     // Labels and colorIds indexed by eventId (insertion order).
     // These are the authoritative source for postprocessor label lookup.
-    _json_file["markerLabels"]   = _markerLabels;
+    _json_file["markerLabels"] = _markerLabels;
     _json_file["markerColorIds"] = _markerColorIds;
 
     // colorId -> label mapping kept for Paraver PCF generation

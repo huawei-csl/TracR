@@ -278,8 +278,8 @@ static inline uint16_t instrumentation_mark_add(const std::string &label) {
  *
  */
 static inline void instrumentation_mark_set(uint16_t channelId,
-                                             uint16_t eventId,
-                                             uint32_t extraId = UINT32_MAX) {
+                                            uint16_t eventId,
+                                            uint32_t extraId = UINT32_MAX) {
   if (TRACR_UNLIKELY(!enable_tracr))
     return;
 

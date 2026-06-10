@@ -388,7 +388,8 @@ void extract_channel_info(const nlohmann::json &metadata, size_t &num_channels,
  * file. Reads the authoritative markerColorIds array when available, with
  * fallback to the legacy markerTypes key iteration for old traces.
  */
-std::vector<std::string> extract_marker_color_ids(const nlohmann::json &metadata) {
+std::vector<std::string>
+extract_marker_color_ids(const nlohmann::json &metadata) {
   std::vector<std::string> color_ids;
 
   if (metadata.contains("markerColorIds") &&
@@ -576,7 +577,8 @@ int perfetto(const std::vector<std::vector<TraCR::Payload>> &bts_files,
   if (metadata.contains("markerLabels") && !metadata["markerLabels"].is_null())
     for (auto &label : metadata["markerLabels"])
       markerLabels.push_back(label);
-  else if (metadata.contains("markerTypes") && !metadata["markerTypes"].is_null())
+  else if (metadata.contains("markerTypes") &&
+           !metadata["markerTypes"].is_null())
     for (auto &[key, value] : metadata["markerTypes"].items())
       markerLabels.push_back(value);
 
