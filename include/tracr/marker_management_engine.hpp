@@ -322,7 +322,18 @@ public:
    * Constructor
    */
   TraCRProc(long tid)
-      : _tracr_init_time(NanoTimer::now()), _tid(tid), _lCPUid(sched_getcpu()) {
+      : _tracr_init_time(NanoTimer::now()), _tid(tid) {
+    // sched_getcpu() is a Linux/glibc extension, unavailable on macOS/BSD (where
+    // the sim build is compiled, incl. arm64 which has no CPU-id API at all).
+    // _lCPUid only labels the per-process trace folder ("proc.<id>/") and a
+    // diagnostic "pid" field, so off-Linux we fall back to getpid(): still unique
+    // per process, so concurrent MPI ranks keep separate folders instead of all
+    // colliding in "proc.-1/". On Linux the behaviour is unchanged.
+#ifdef __linux__
+    _lCPUid = sched_getcpu();
+#else
+    _lCPUid = static_cast<int>(getpid());
+#endif
 
     _proc_folder_name = "proc." + std::to_string(_lCPUid) + "/";
 
