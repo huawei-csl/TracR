@@ -583,9 +583,10 @@ int perfetto(const std::vector<std::vector<TraCR::Payload>> &bts_files,
       markerLabels.push_back(value);
 
   // Optional extraId -> human-readable label map (e.g. func_id -> kernel name),
-  // keyed by the stringified extraId. When present, each slice whose extraId has
-  // an entry gets an "extra_label" arg alongside "extra_id". Absent for traces
-  // whose producer registered no labels — those keep emitting extra_id only.
+  // keyed by the stringified extraId. When present, each slice whose extraId
+  // has an entry gets an "extra_label" arg alongside "extra_id". Absent for
+  // traces whose producer registered no labels — those keep emitting extra_id
+  // only.
   const nlohmann::json *extraIdLabels = nullptr;
   if (metadata.contains("extraIdLabels") &&
       !metadata["extraIdLabels"].is_null())
