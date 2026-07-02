@@ -582,6 +582,15 @@ int perfetto(const std::vector<std::vector<TraCR::Payload>> &bts_files,
     for (auto &[key, value] : metadata["markerTypes"].items())
       markerLabels.push_back(value);
 
+  // Optional extraId -> human-readable label map (e.g. func_id -> kernel name),
+  // keyed by the stringified extraId. When present, each slice whose extraId has
+  // an entry gets an "extra_label" arg alongside "extra_id". Absent for traces
+  // whose producer registered no labels — those keep emitting extra_id only.
+  const nlohmann::json *extraIdLabels = nullptr;
+  if (metadata.contains("extraIdLabels") &&
+      !metadata["extraIdLabels"].is_null())
+    extraIdLabels = &metadata["extraIdLabels"];
+
   std::ofstream out(base_path / "perfetto.json");
   if (!out.is_open()) {
     std::cerr << "Failed to open 'perfetto.json' for writing!\n";
@@ -636,8 +645,16 @@ int perfetto(const std::vector<std::vector<TraCR::Payload>> &bts_files,
           << ",\"ts\":" << fmt_us(prev.timestamp - start_time)
           << ",\"dur\":" << fmt_us(payload.timestamp - prev.timestamp)
           << ",\"pid\":" << pid << ",\"tid\":" << (prev.channelId + 1);
-      if (prev.extraId != UINT32_MAX)
-        out << ",\"args\":{\"extra_id\":" << prev.extraId << "}";
+      if (prev.extraId != UINT32_MAX) {
+        out << ",\"args\":{\"extra_id\":" << prev.extraId;
+        if (extraIdLabels) {
+          auto label_it = extraIdLabels->find(std::to_string(prev.extraId));
+          if (label_it != extraIdLabels->end())
+            out << ",\"extra_label\":"
+                << json_str(label_it.value().get<std::string>());
+        }
+        out << "}";
+      }
       out << "}";
     }
 
