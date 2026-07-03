@@ -14,9 +14,11 @@
  * limitations under the License.
  */
 
+#include <algorithm>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <map>
 #include <queue>
 #include <sstream>
 #include <unordered_map>
@@ -143,6 +145,28 @@ public:
 };
 
 /**
+ * All trace data belonging to one proc folder (one process / MPI rank / NPU).
+ */
+struct ProcData {
+  // process id parsed from the "proc.<id>" folder name
+  int pid = -1;
+
+  nlohmann::json metadata;
+
+  // One timestamp-sorted payload vector per thread folder
+  std::vector<std::vector<TraCR::Payload>> bts_files;
+  std::vector<pid_t> bts_tids;
+
+  // Synchronization anchors in the proc-local clock domain. Every payload
+  // timestamp of this proc is normalized to sync_start, assuming all procs
+  // pass INSTRUMENTATION_START() at the same real instant (e.g. right after
+  // a blocking collective such as MPI_Init). sync_end enables interpolation
+  // once intermediate sync stations (INSTRUMENTATION_SYNC) exist.
+  uint64_t sync_start = 0;
+  uint64_t sync_end = 0;
+};
+
+/**
  * A function to load a bts file into a std::vector<Payload>
  */
 bool load_bts_file(const fs::path &filepath,
@@ -261,52 +285,88 @@ int load_metadata_json(const fs::path &proc_path, nlohmann::json &metadata) {
 }
 
 /**
- * A function for extracting the bts and metadata
+ * Determines the per-proc synchronization anchors. Prefers the start_time /
+ * end_time pair written to metadata.json; falls back to the earliest / latest
+ * payload timestamp for traces recorded by older library versions.
  */
-int extract_bts_metadata(std::vector<std::vector<TraCR::Payload>> &bts_files,
-                         std::vector<pid_t> &bts_tids, nlohmann::json &metadata,
-                         const fs::path base_path, int &pid) {
+void extract_sync_anchors(ProcData &proc) {
+  uint64_t first = UINT64_MAX;
+  uint64_t last = 0;
+  for (const auto &traces : proc.bts_files) {
+    if (traces.empty())
+      continue;
+    first = std::min(first, traces.front().timestamp);
+    last = std::max(last, traces.back().timestamp);
+  }
 
-  bool proc_folder_found = false;
+  if (proc.metadata.contains("start_time") &&
+      !proc.metadata["start_time"].is_null())
+    first = std::min(proc.metadata["start_time"].get<uint64_t>(), first);
+
+  if (proc.metadata.contains("end_time") &&
+      !proc.metadata["end_time"].is_null())
+    last = std::max(proc.metadata["end_time"].get<uint64_t>(), last);
+
+  proc.sync_start = (first == UINT64_MAX) ? 0 : first;
+  proc.sync_end = last;
+}
+
+/**
+ * A function for extracting the bts and metadata of every proc folder
+ */
+int extract_bts_metadata(std::vector<ProcData> &procs,
+                         const fs::path base_path) {
+
   for (const auto &proc_entry : fs::directory_iterator(base_path)) {
-    if (proc_entry.is_directory() &&
-        proc_entry.path().filename().string().find("proc.") == 0) {
-      std::cout << "Found proc folder: " << proc_entry.path() << "\n";
+    if (!proc_entry.is_directory() ||
+        proc_entry.path().filename().string().find("proc.") != 0)
+      continue;
 
-      if (proc_folder_found) {
-        std::cerr << "Error: Currently, having more than one proc folder is "
-                     "illegal.\n";
-        return 1;
-      }
-      proc_folder_found = true;
+    std::cout << "Found proc folder: " << proc_entry.path() << "\n";
 
-      std::string folder_name = proc_entry.path().filename().string();
-      std::size_t dot_pos = folder_name.find('.');
-      if (dot_pos != std::string::npos) {
-        std::string pid_str = folder_name.substr(dot_pos + 1);
-        try {
-          pid = std::stoi(pid_str);
-        } catch (const std::exception &e) {
-          std::cerr << "  Error parsing TID in folder: " << folder_name << "\n";
-          return 1;
-        }
-      }
+    ProcData proc;
 
-      if (load_metadata_json(proc_entry.path(), metadata) != 0) {
-        return 1;
-      }
-
-      if (load_thread_traces(proc_entry.path(), bts_files, bts_tids) != 0) {
-        std::cerr << "Error: load_thread_traces() failed.\n";
+    std::string folder_name = proc_entry.path().filename().string();
+    std::size_t dot_pos = folder_name.find('.');
+    if (dot_pos != std::string::npos) {
+      std::string pid_str = folder_name.substr(dot_pos + 1);
+      try {
+        proc.pid = std::stoi(pid_str);
+      } catch (const std::exception &e) {
+        std::cerr << "  Error parsing PID in folder: " << folder_name << "\n";
         return 1;
       }
     }
+
+    if (load_metadata_json(proc_entry.path(), proc.metadata) != 0) {
+      return 1;
+    }
+
+    if (load_thread_traces(proc_entry.path(), proc.bts_files, proc.bts_tids) !=
+        0) {
+      std::cerr << "Error: load_thread_traces() failed.\n";
+      return 1;
+    }
+
+    extract_sync_anchors(proc);
+
+    std::cout << "  Sync anchors: start=" << proc.sync_start
+              << " end=" << proc.sync_end << " (duration "
+              << (proc.sync_end - proc.sync_start) << " ns)\n";
+
+    procs.push_back(std::move(proc));
   }
 
-  if (!proc_folder_found) {
+  if (procs.empty()) {
     std::cerr << "Error: No proc folder found.\n";
     return 1;
   }
+
+  // Deterministic proc/task numbering regardless of directory iteration order
+  std::sort(procs.begin(), procs.end(),
+            [](const ProcData &a, const ProcData &b) { return a.pid < b.pid; });
+
+  std::cout << "Found " << procs.size() << " proc folder(s)\n";
 
   return 0;
 }
@@ -332,9 +392,12 @@ int copy_state_cfg(const fs::path &base_path) {
 
 /**
  * Create the tracr.pcf file
+ *
+ * The colorId -> label mapping is merged over all procs, as every proc
+ * registers its own markers and they do not have to match.
  */
 int create_tracr_pcf(const fs::path &base_path,
-                     const nlohmann::json &metadata) {
+                     const std::vector<ProcData> &procs) {
   std::ofstream out(base_path / "tracr.pcf");
   if (!out) {
     std::cerr << "Error opening tracr.pcf for writing\n";
@@ -343,17 +406,24 @@ int create_tracr_pcf(const fs::path &base_path,
 
   out << PARAVER_HEADER;
 
-  const nlohmann::json *markerTypes_json = nullptr;
+  std::map<std::string, nlohmann::json> merged;
+  for (const auto &proc : procs) {
+    if (!proc.metadata.contains("markerTypes") ||
+        proc.metadata["markerTypes"].is_null())
+      continue;
 
-  if (metadata.contains("markerTypes") && !metadata["markerTypes"].is_null()) {
-    markerTypes_json = &metadata["markerTypes"];
+    for (auto it = proc.metadata["markerTypes"].begin();
+         it != proc.metadata["markerTypes"].end(); ++it) {
+      auto [pos, inserted] = merged.emplace(it.key(), it.value());
+      if (!inserted && pos->second != it.value())
+        std::cout << "WARNING: colorId " << it.key()
+                  << " maps to different labels across procs: " << pos->second
+                  << " vs " << it.value() << " (keeping the first)\n";
+    }
   }
 
-  if (markerTypes_json) {
-    for (auto it = markerTypes_json->begin(); it != markerTypes_json->end();
-         ++it) {
-      out << it.key() << "   " << it.value() << "\n";
-    }
+  for (const auto &[key, value] : merged) {
+    out << key << "   " << value << "\n";
   }
 
   out.close();
@@ -363,24 +433,27 @@ int create_tracr_pcf(const fs::path &base_path,
 }
 
 /**
- *
+ * Extracts the channel names of one proc (if given) and returns its number of
+ * channels.
  */
-void extract_channel_info(const nlohmann::json &metadata, size_t &num_channels,
-                          std::stringstream &ss) {
-  num_channels = 1; // default
+size_t extract_channel_info(const nlohmann::json &metadata,
+                            std::vector<std::string> &channel_names) {
+  size_t num_channels = 1; // default
 
   if (metadata.contains("channel_names") &&
       !metadata["channel_names"].is_null()) {
 
     num_channels = metadata["channel_names"].size();
     for (auto &channel_name : metadata["channel_names"])
-      ss << channel_name << "\n";
+      channel_names.push_back(channel_name);
 
   } else if (metadata.contains("num_channels") &&
              !metadata["num_channels"].is_null()) {
 
     num_channels = metadata["num_channels"];
   }
+
+  return num_channels;
 }
 
 /**
@@ -406,18 +479,21 @@ extract_marker_color_ids(const nlohmann::json &metadata) {
 }
 
 /**
- * Create the tracr.prv file for Paraver format
+ * Create the tracr.prv file for Paraver format.
+ *
+ * Every proc becomes one Paraver task (application 1), every channel one
+ * thread within its task. Timestamps are normalized per proc to its
+ * sync_start anchor and the records of all procs are emitted in global time
+ * order.
  */
-int create_tracr_prv(const fs::path &base_path, const nlohmann::json &metadata,
-                     const std::vector<std::vector<TraCR::Payload>> &bts_files,
-                     size_t &num_channels, std::stringstream &ss) {
+int create_tracr_prv(const fs::path &base_path,
+                     const std::vector<ProcData> &procs,
+                     const std::vector<size_t> &proc_channels) {
   std::ofstream out(base_path / "tracr.prv");
   if (!out) {
     std::cerr << "Error opening tracr.prv for writing\n";
     return 1;
   }
-
-  extract_channel_info(metadata, num_channels, ss);
 
   auto now = std::chrono::system_clock::now();
   std::time_t now_time = std::chrono::system_clock::to_time_t(now);
@@ -428,36 +504,65 @@ int create_tracr_prv(const fs::path &base_path, const nlohmann::json &metadata,
       << "/" << std::setw(2) << std::setfill('0') << (local_tm->tm_year % 100)
       << " at " << std::setw(2) << std::setfill('0') << local_tm->tm_hour << ":"
       << std::setw(2) << std::setfill('0') << local_tm->tm_min
-      << "):00000000000000000000_ns:0:1:1(" << num_channels << ":1)\n";
+      << "):00000000000000000000_ns:0:1:" << procs.size() << "(";
 
-  std::vector<std::string> markerColorIds = extract_marker_color_ids(metadata);
+  for (size_t p = 0; p < procs.size(); ++p)
+    out << proc_channels[p] << ":1" << (p + 1 < procs.size() ? "," : "");
 
-  bool first = true;
-  uint64_t start_time = 0;
+  out << ")\n";
 
-  PayloadMerger merger(bts_files);
-  while (!merger.empty()) {
-    auto [payload, index] = merger.next();
-
-    if (first) {
-      first = false;
-      start_time = payload.timestamp;
-    }
-
+  struct PrvRecord {
+    uint64_t timestamp; // normalized to the proc's sync_start
+    uint32_t task;      // 1-based proc index
+    uint32_t thread;    // 1-based channel
     std::string colorId;
+  };
 
-    if (!markerColorIds.empty()) {
-      colorId = (payload.eventId == UINT16_MAX)
-                    ? "0"
-                    : markerColorIds[payload.eventId];
-    } else {
-      colorId = (payload.eventId == UINT16_MAX)
-                    ? "0"
-                    : std::to_string(payload.eventId);
+  size_t tot_num_traces = 0;
+  for (const auto &proc : procs)
+    for (const auto &traces : proc.bts_files)
+      tot_num_traces += traces.size();
+
+  std::vector<PrvRecord> records;
+  records.reserve(tot_num_traces);
+
+  for (size_t p = 0; p < procs.size(); ++p) {
+    const ProcData &proc = procs[p];
+
+    std::vector<std::string> markerColorIds =
+        extract_marker_color_ids(proc.metadata);
+
+    PayloadMerger merger(proc.bts_files);
+    while (!merger.empty()) {
+      auto [payload, index] = merger.next();
+
+      std::string colorId;
+
+      if (!markerColorIds.empty()) {
+        colorId = (payload.eventId == UINT16_MAX)
+                      ? "0"
+                      : markerColorIds[payload.eventId];
+      } else {
+        colorId = (payload.eventId == UINT16_MAX)
+                      ? "0"
+                      : std::to_string(payload.eventId);
+      }
+
+      records.push_back(
+          {payload.timestamp - proc.sync_start, static_cast<uint32_t>(p + 1),
+           static_cast<uint32_t>(payload.channelId) + 1, std::move(colorId)});
     }
+  }
 
-    out << "2:0:1:1:" << payload.channelId + 1 << ":"
-        << (payload.timestamp - start_time) << ":90:" << colorId << "\n";
+  // Paraver expects the records of all tasks in global time order
+  std::stable_sort(records.begin(), records.end(),
+                   [](const PrvRecord &a, const PrvRecord &b) {
+                     return a.timestamp < b.timestamp;
+                   });
+
+  for (const auto &record : records) {
+    out << "2:0:1:" << record.task << ":" << record.thread << ":"
+        << record.timestamp << ":90:" << record.colorId << "\n";
   }
 
   out.close();
@@ -469,8 +574,8 @@ int create_tracr_prv(const fs::path &base_path, const nlohmann::json &metadata,
 /**
  *
  */
-int create_tracr_row(const fs::path &base_path, size_t num_channels,
-                     const std::stringstream &ss) {
+int create_tracr_row(const fs::path &base_path,
+                     const std::vector<std::string> &row_names) {
   std::ofstream out(base_path / "tracr.row");
   if (!out) {
     std::cerr << "Error opening tracr.row for writing\n";
@@ -480,15 +585,10 @@ int create_tracr_row(const fs::path &base_path, size_t num_channels,
   out << "LEVEL NODE SIZE 1\n"
          "hostname\n\n"
          "LEVEL THREAD SIZE "
-      << num_channels << "\n";
+      << row_names.size() << "\n";
 
-  if (!ss.str().empty()) {
-    out << ss.str();
-  } else {
-    for (size_t i = 0; i < num_channels; ++i) {
-      out << "Channel_" << i << "\n";
-    }
-  }
+  for (const auto &name : row_names)
+    out << name << "\n";
 
   out.close();
   std::cout << "tracr.row written successfully.\n";
@@ -499,24 +599,38 @@ int create_tracr_row(const fs::path &base_path, size_t num_channels,
 /**
  * Store in Paraver format
  */
-int paraver(const std::vector<std::vector<TraCR::Payload>> &bts_files,
-            const std::vector<pid_t> &bts_tids, nlohmann::json &metadata,
-            const fs::path base_path, int &pid) {
+int paraver(const std::vector<ProcData> &procs, const fs::path base_path) {
   if (copy_state_cfg(base_path) != 0) {
     return 1;
   }
 
-  if (create_tracr_pcf(base_path, metadata) != 0) {
+  if (create_tracr_pcf(base_path, procs) != 0) {
     return 1;
   }
 
-  size_t num_channels = 1;
-  std::stringstream ss;
-  if (create_tracr_prv(base_path, metadata, bts_files, num_channels, ss) != 0) {
+  // Channel counts and flat (task-major) thread names for the row file
+  std::vector<size_t> proc_channels(procs.size());
+  std::vector<std::string> row_names;
+
+  for (size_t p = 0; p < procs.size(); ++p) {
+    std::vector<std::string> channel_names;
+    proc_channels[p] = extract_channel_info(procs[p].metadata, channel_names);
+
+    for (size_t c = 0; c < proc_channels[p]; ++c) {
+      std::string name = (c < channel_names.size())
+                             ? channel_names[c]
+                             : ("Channel_" + std::to_string(c));
+      if (procs.size() > 1)
+        name = "proc." + std::to_string(procs[p].pid) + ":" + name;
+      row_names.push_back(std::move(name));
+    }
+  }
+
+  if (create_tracr_prv(base_path, procs, proc_channels) != 0) {
     return 1;
   }
 
-  if (create_tracr_row(base_path, num_channels, ss) != 0) {
+  if (create_tracr_row(base_path, row_names) != 0) {
     return 1;
   }
 
@@ -549,48 +663,11 @@ void validate_last_events_for_perfetto(
  * Store in Perfetto format.
  *
  * Writes a JSON object with a "traceEvents" array in nanoseconds. Events are
- * streamed directly to disk — no in-memory JSON array is built.
+ * streamed directly to disk — no in-memory JSON array is built. Every proc
+ * shows up as its own process (pid), with its channels as threads (tid).
+ * Timestamps are normalized per proc to its sync_start anchor.
  */
-int perfetto(const std::vector<std::vector<TraCR::Payload>> &bts_files,
-             const std::vector<pid_t> &bts_tids, nlohmann::json &metadata,
-             const fs::path base_path, int &pid) {
-
-  if (pid == -1)
-    pid = 0;
-
-  // Extract channel count and names
-  uint32_t num_channels = 1;
-  const nlohmann::json *channels_json = nullptr;
-  if (metadata.contains("channel_names") &&
-      !metadata["channel_names"].is_null())
-    channels_json = &metadata["channel_names"];
-  if (channels_json)
-    num_channels = channels_json->size();
-  else if (metadata.contains("num_channels") &&
-           !metadata["num_channels"].is_null())
-    num_channels = metadata["num_channels"];
-
-  // Extract marker labels indexed by eventId.
-  // Prefer markerLabels array (correct insertion order); fall back to
-  // markerTypes key iteration for traces produced by older library versions.
-  std::vector<std::string> markerLabels;
-  if (metadata.contains("markerLabels") && !metadata["markerLabels"].is_null())
-    for (auto &label : metadata["markerLabels"])
-      markerLabels.push_back(label);
-  else if (metadata.contains("markerTypes") &&
-           !metadata["markerTypes"].is_null())
-    for (auto &[key, value] : metadata["markerTypes"].items())
-      markerLabels.push_back(value);
-
-  // Optional extraId -> human-readable label map (e.g. func_id -> kernel name),
-  // keyed by the stringified extraId. When present, each slice whose extraId
-  // has an entry gets an "extra_label" arg alongside "extra_id". Absent for
-  // traces whose producer registered no labels — those keep emitting extra_id
-  // only.
-  const nlohmann::json *extraIdLabels = nullptr;
-  if (metadata.contains("extraIdLabels") &&
-      !metadata["extraIdLabels"].is_null())
-    extraIdLabels = &metadata["extraIdLabels"];
+int perfetto(const std::vector<ProcData> &procs, const fs::path base_path) {
 
   std::ofstream out(base_path / "perfetto.json");
   if (!out.is_open()) {
@@ -601,68 +678,114 @@ int perfetto(const std::vector<std::vector<TraCR::Payload>> &bts_files,
   // Wrapper object: traceEvents array + ns time unit
   out << "{\"traceEvents\":[\n";
 
-  // Process name metadata event (first entry — no leading comma)
-  out << "{\"name\":\"process_name\",\"ph\":\"M\",\"pid\":" << pid
-      << ",\"args\":{\"name\":\"TraCR\"}}";
+  bool first_event = true;
+  auto emit_comma = [&]() {
+    if (!first_event)
+      out << ",\n";
+    first_event = false;
+  };
 
-  // Thread name metadata events (one per channel)
-  for (uint32_t i = 0; i < num_channels; ++i) {
-    std::string name = channels_json ? std::string((*channels_json)[i])
-                                     : ("Channel_" + std::to_string(i + 1));
-    out << ",\n{\"name\":\"thread_name\",\"ph\":\"M\",\"pid\":" << pid
-        << ",\"tid\":" << (i + 1) << ",\"args\":{\"name\":" << json_str(name)
-        << "}}";
-  }
+  for (size_t p = 0; p < procs.size(); ++p) {
+    const ProcData &proc = procs[p];
+    const int pid = (proc.pid == -1) ? 0 : proc.pid;
 
-  // Merge all thread buffers in timestamp order and emit complete events (ph=X)
-  bool first = true;
-  uint64_t start_time = 0;
-  std::vector<TraCR::Payload> prev_payloads(
-      num_channels, TraCR::Payload{0, UINT16_MAX, UINT32_MAX, 0});
+    // Extract channel count and names
+    uint32_t num_channels = 1;
+    const nlohmann::json *channels_json = nullptr;
+    if (proc.metadata.contains("channel_names") &&
+        !proc.metadata["channel_names"].is_null())
+      channels_json = &proc.metadata["channel_names"];
+    if (channels_json)
+      num_channels = channels_json->size();
+    else if (proc.metadata.contains("num_channels") &&
+             !proc.metadata["num_channels"].is_null())
+      num_channels = proc.metadata["num_channels"];
 
-  PayloadMerger merger(bts_files);
-  while (!merger.empty()) {
-    auto [payload, index] = merger.next();
+    // Extract marker labels indexed by eventId.
+    // Prefer markerLabels array (correct insertion order); fall back to
+    // markerTypes key iteration for traces produced by older library versions.
+    std::vector<std::string> markerLabels;
+    if (proc.metadata.contains("markerLabels") &&
+        !proc.metadata["markerLabels"].is_null())
+      for (auto &label : proc.metadata["markerLabels"])
+        markerLabels.push_back(label);
+    else if (proc.metadata.contains("markerTypes") &&
+             !proc.metadata["markerTypes"].is_null())
+      for (auto &[key, value] : proc.metadata["markerTypes"].items())
+        markerLabels.push_back(value);
 
-    if (first) {
-      first = false;
-      start_time = payload.timestamp;
+    // Optional extraId -> human-readable label map (e.g. func_id -> kernel
+    // name), keyed by the stringified extraId. When present, each slice whose
+    // extraId has an entry gets an "extra_label" arg alongside "extra_id".
+    // Absent for traces whose producer registered no labels — those keep
+    // emitting extra_id only.
+    const nlohmann::json *extraIdLabels = nullptr;
+    if (proc.metadata.contains("extraIdLabels") &&
+        !proc.metadata["extraIdLabels"].is_null())
+      extraIdLabels = &proc.metadata["extraIdLabels"];
+
+    // Process name + stable UI ordering metadata events
+    emit_comma();
+    out << "{\"name\":\"process_name\",\"ph\":\"M\",\"pid\":" << pid
+        << ",\"args\":{\"name\":"
+        << json_str("TraCR proc." + std::to_string(pid)) << "}}";
+    out << ",\n{\"name\":\"process_sort_index\",\"ph\":\"M\",\"pid\":" << pid
+        << ",\"args\":{\"sort_index\":" << p << "}}";
+
+    // Thread name metadata events (one per channel)
+    for (uint32_t i = 0; i < num_channels; ++i) {
+      std::string name = channels_json ? std::string((*channels_json)[i])
+                                       : ("Channel_" + std::to_string(i + 1));
+      out << ",\n{\"name\":\"thread_name\",\"ph\":\"M\",\"pid\":" << pid
+          << ",\"tid\":" << (i + 1) << ",\"args\":{\"name\":" << json_str(name)
+          << "}}";
     }
 
-    uint16_t channelId = payload.channelId;
-    if (channelId >= num_channels) {
-      std::cerr << "Payload channelId " << channelId << " is out of bounds!\n";
-      return 1;
-    }
+    // Merge the proc's thread buffers in timestamp order and emit complete
+    // events (ph=X)
+    std::vector<TraCR::Payload> prev_payloads(
+        num_channels, TraCR::Payload{0, UINT16_MAX, UINT32_MAX, 0});
 
-    if (prev_payloads[channelId].eventId != UINT16_MAX) {
-      const TraCR::Payload &prev = prev_payloads[channelId];
-      std::string mType = (!markerLabels.empty())
-                              ? markerLabels[prev.eventId]
-                              : std::to_string(prev.eventId);
+    PayloadMerger merger(proc.bts_files);
+    while (!merger.empty()) {
+      auto [payload, index] = merger.next();
 
-      out << ",\n{\"name\":" << json_str(mType)
-          << ",\"cat\":\"tracr\",\"ph\":\"X\""
-          << ",\"ts\":" << fmt_us(prev.timestamp - start_time)
-          << ",\"dur\":" << fmt_us(payload.timestamp - prev.timestamp)
-          << ",\"pid\":" << pid << ",\"tid\":" << (prev.channelId + 1);
-      if (prev.extraId != UINT32_MAX) {
-        out << ",\"args\":{\"extra_id\":" << prev.extraId;
-        if (extraIdLabels) {
-          auto label_it = extraIdLabels->find(std::to_string(prev.extraId));
-          if (label_it != extraIdLabels->end())
-            out << ",\"extra_label\":"
-                << json_str(label_it.value().get<std::string>());
+      uint16_t channelId = payload.channelId;
+      if (channelId >= num_channels) {
+        std::cerr << "Payload channelId " << channelId
+                  << " is out of bounds!\n";
+        return 1;
+      }
+
+      if (prev_payloads[channelId].eventId != UINT16_MAX) {
+        const TraCR::Payload &prev = prev_payloads[channelId];
+        std::string mType = (!markerLabels.empty())
+                                ? markerLabels[prev.eventId]
+                                : std::to_string(prev.eventId);
+
+        out << ",\n{\"name\":" << json_str(mType)
+            << ",\"cat\":\"tracr\",\"ph\":\"X\""
+            << ",\"ts\":" << fmt_us(prev.timestamp - proc.sync_start)
+            << ",\"dur\":" << fmt_us(payload.timestamp - prev.timestamp)
+            << ",\"pid\":" << pid << ",\"tid\":" << (prev.channelId + 1);
+        if (prev.extraId != UINT32_MAX) {
+          out << ",\"args\":{\"extra_id\":" << prev.extraId;
+          if (extraIdLabels) {
+            auto label_it = extraIdLabels->find(std::to_string(prev.extraId));
+            if (label_it != extraIdLabels->end())
+              out << ",\"extra_label\":"
+                  << json_str(label_it.value().get<std::string>());
+          }
+          out << "}";
         }
         out << "}";
       }
-      out << "}";
+
+      prev_payloads[channelId] = payload;
     }
 
-    prev_payloads[channelId] = payload;
+    validate_last_events_for_perfetto(proc.bts_files, proc.bts_tids);
   }
-
-  validate_last_events_for_perfetto(bts_files, bts_tids);
 
   out << "\n]}\n";
   out.close();
@@ -674,58 +797,65 @@ int perfetto(const std::vector<std::vector<TraCR::Payload>> &bts_files,
 /**
  * Dump trace info to terminal
  */
-int dump_info(const std::vector<std::vector<TraCR::Payload>> &bts_files,
-              const std::vector<pid_t> &bts_tids, const fs::path base_path) {
+int dump_info(const std::vector<ProcData> &procs) {
 
-  std::unordered_map<uint16_t, int32_t> channelIds_check;
-  std::unordered_map<uint16_t, std::unordered_set<uint32_t>> extraIds_check;
+  for (const ProcData &proc : procs) {
+    std::cout << "\n===== proc." << proc.pid << " =====\n";
+    std::cout << "Sync anchors: start=" << proc.sync_start
+              << " end=" << proc.sync_end << " (duration "
+              << (proc.sync_end - proc.sync_start) << " ns)\n";
 
-  std::cout << "Thread[x]: [channelId, eventId, extraId, timestamp]\n";
+    std::unordered_map<uint16_t, int32_t> channelIds_check;
+    std::unordered_map<uint16_t, std::unordered_set<uint32_t>> extraIds_check;
 
-  PayloadMerger merger(bts_files);
-  while (!merger.empty()) {
-    auto [payload, index] = merger.next();
+    std::cout << "Thread[x]: [channelId, eventId, extraId, timestamp]\n";
 
-    std::cout << "Thread[" << bts_tids[index] << "]: [" << payload.channelId
-              << ", " << payload.eventId << ", " << payload.extraId << ", "
-              << payload.timestamp << "]\n";
+    PayloadMerger merger(proc.bts_files);
+    while (!merger.empty()) {
+      auto [payload, index] = merger.next();
 
-    int32_t &counter = channelIds_check[payload.channelId];
-    if (payload.eventId == UINT16_MAX) {
-      --counter;
-    } else {
-      ++counter;
-    }
+      std::cout << "Thread[" << proc.bts_tids[index] << "]: ["
+                << payload.channelId << ", " << payload.eventId << ", "
+                << payload.extraId << ", " << payload.timestamp << "]\n";
 
-    auto &inner_set = extraIds_check[payload.channelId];
-    auto it_inner = inner_set.find(payload.extraId);
-    if (it_inner == inner_set.end()) {
-      inner_set.insert(payload.extraId);
-    } else {
-      inner_set.erase(it_inner);
-    }
-  }
-
-  std::cout << "\nChannels which do not follow Push/Pop methology: {channelId, "
-               "count}\n";
-  for (const auto &[key, value] : channelIds_check) {
-    if (value != 0) {
-      std::cout << "{" << key << ", " << value << "}\n";
-    }
-  }
-
-  std::cout << "\nChannels which do not follow Push/Pop methology for the "
-               "extraIds: channelId: {extraIds...}\n";
-  for (const auto &[channelId, inner_set] : extraIds_check) {
-    if (inner_set.size() > 0) {
-      std::cout << channelId << ": {";
-      for (const auto &value : inner_set) {
-        std::cout << value << ", ";
+      int32_t &counter = channelIds_check[payload.channelId];
+      if (payload.eventId == UINT16_MAX) {
+        --counter;
+      } else {
+        ++counter;
       }
-      std::cout << "}\n";
+
+      auto &inner_set = extraIds_check[payload.channelId];
+      auto it_inner = inner_set.find(payload.extraId);
+      if (it_inner == inner_set.end()) {
+        inner_set.insert(payload.extraId);
+      } else {
+        inner_set.erase(it_inner);
+      }
     }
+
+    std::cout
+        << "\nChannels which do not follow Push/Pop methology: {channelId, "
+           "count}\n";
+    for (const auto &[key, value] : channelIds_check) {
+      if (value != 0) {
+        std::cout << "{" << key << ", " << value << "}\n";
+      }
+    }
+
+    std::cout << "\nChannels which do not follow Push/Pop methology for the "
+                 "extraIds: channelId: {extraIds...}\n";
+    for (const auto &[channelId, inner_set] : extraIds_check) {
+      if (inner_set.size() > 0) {
+        std::cout << channelId << ": {";
+        for (const auto &value : inner_set) {
+          std::cout << value << ", ";
+        }
+        std::cout << "}\n";
+      }
+    }
+    std::cout << "\n";
   }
-  std::cout << "\n";
 
   return 0;
 }
@@ -763,32 +893,28 @@ int main(int argc, char *argv[]) {
     format = argv[2];
   }
 
-  std::vector<std::vector<TraCR::Payload>> bts_files;
-  std::vector<pid_t> bts_tids;
-  nlohmann::json metadata;
-  int pid = -1;
+  std::vector<ProcData> procs;
 
-  if (extract_bts_metadata(bts_files, bts_tids, metadata, base_path, pid) !=
-      0) {
+  if (extract_bts_metadata(procs, base_path) != 0) {
     std::cerr << "extract_bts_metadata() failed\n";
     return 1;
   }
 
   switch (parseFormat(format)) {
   case Format::PARAVER:
-    if (paraver(bts_files, bts_tids, metadata, base_path, pid) != 0) {
+    if (paraver(procs, base_path) != 0) {
       std::cerr << "paraver() failed\n";
       return 1;
     }
     break;
   case Format::DUMP:
-    if (dump_info(bts_files, bts_tids, base_path) != 0) {
+    if (dump_info(procs) != 0) {
       std::cerr << "dump_info() failed\n";
       return 1;
     }
     break;
   case Format::PERFETTO:
-    if (perfetto(bts_files, bts_tids, metadata, base_path, pid) != 0) {
+    if (perfetto(procs, base_path) != 0) {
       std::cerr << "perfetto() failed\n";
       return 1;
     }

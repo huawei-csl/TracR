@@ -31,7 +31,6 @@
 #include <iomanip>
 #include <iostream>
 #include <nlohmann/json.hpp>
-#include <sched.h>
 #include <sstream>
 #include <string>
 #include <sys/stat.h>
@@ -322,19 +321,13 @@ public:
    * Constructor
    */
   TraCRProc(long tid) : _tracr_init_time(NanoTimer::now()), _tid(tid) {
-    // sched_getcpu() is a Linux/glibc extension, unavailable on macOS/BSD
-    // (where the sim build is compiled, incl. arm64 which has no CPU-id API at
-    // all). _lCPUid only labels the per-process trace folder ("proc.<id>/") and
-    // a diagnostic "pid" field, so off-Linux we fall back to getpid(): still
-    // unique per process, so concurrent MPI ranks keep separate folders instead
-    // of all colliding in "proc.-1/". On Linux the behaviour is unchanged.
-#ifdef __linux__
-    _lCPUid = sched_getcpu();
-#else
-    _lCPUid = static_cast<int>(getpid());
-#endif
+    // getpid() is guaranteed unique per process, so concurrent procs (e.g.
+    // MPI ranks on the same node) always get separate "proc.<id>/" folders.
+    // The previously used sched_getcpu() could collide when two ranks were
+    // scheduled on the same core, silently corrupting each other's traces.
+    _procId = static_cast<int>(getpid());
 
-    _proc_folder_name = "proc." + std::to_string(_lCPUid) + "/";
+    _proc_folder_name = "proc." + std::to_string(_procId) + "/";
 
     debug_print("_proc_folder_name: %s", _proc_folder_name.c_str());
   };
@@ -395,6 +388,11 @@ public:
       write_JSON();
     }
 
+    // Refresh the end-of-profiling sync anchor as late as possible so it
+    // still reflects the dump time when write_JSON() ran earlier (e.g. via
+    // instrumentation_get_json_str()).
+    _json_file["end_time"] = NanoTimer::now();
+
     // Create and open the metadata.json file
     std::string filename = _proc_folder_name + "metadata.json";
     std::ofstream file(filename);
@@ -433,8 +431,14 @@ public:
    *
    */
   inline void write_JSON() {
-    _json_file["pid"] = _lCPUid;
+    _json_file["pid"] = _procId;
+
+    // Synchronization anchors: start_time is taken at INSTRUMENTATION_START(),
+    // end_time here (and refreshed at dump time). Both live in the same clock
+    // domain as the payload timestamps, so the postprocessor can align
+    // multiple procs on them (blocking-collective assumption).
     _json_file["start_time"] = _tracr_init_time;
+    _json_file["end_time"] = NanoTimer::now();
 
     // Labels and colorIds indexed by eventId (insertion order).
     // These are the authoritative source for postprocessor label lookup.
@@ -479,8 +483,8 @@ private:
   // kernel thread ID
   long _tid;
 
-  // logical CPU ID
-  int _lCPUid;
+  // process ID (labels the proc folder and the metadata "pid" field)
+  int _procId;
 };
 
 } // namespace TraCR

@@ -1,6 +1,10 @@
 testSuite = ['examples']
 
 cleanup_script = find_program('bash_scripts/cleanup_script.sh', native: true, required: true)
+multiproc_script = find_program('bash_scripts/multiproc_run.sh', native: true, required: true)
+
+# Number of concurrent instances used to simulate a multiproc (MPI-like) run
+multiproc_num_procs = '4'
 
 test_types = ['simple', 'pthread', 'performance_test']
 
@@ -39,6 +43,32 @@ foreach args : cpp_args_list
                     suite : testSuite,
                     is_parallel : false,
                     priority : 0)
+            endforeach
+
+            # Simulated multiproc run (no MPI needed): the same example is
+            # launched multiproc_num_procs times concurrently into a shared
+            # tracr/ folder, then postprocessed in every format. Negative
+            # priorities sequence this after the single-proc tests above.
+            test('cleanup_script_multiproc_' + test_name, cleanup_script,
+                    workdir: output_dir,
+                    suite : testSuite,
+                    is_parallel : false,
+                    priority : -1)
+
+            test('multiproc_' + test_name, multiproc_script,
+                    args : [multiproc_num_procs, exe],
+                    workdir: output_dir,
+                    suite : testSuite,
+                    is_parallel : false,
+                    priority : -2)
+
+            foreach format : ['paraver', 'perfetto', 'dump']
+                test('tracr_process_multiproc_' + format + '_' + test_name, tracr_process,
+                    workdir: meson.current_build_dir() / '../postprocessing',
+                    args : [ output_dir / 'tracr', format],
+                    suite : testSuite,
+                    is_parallel : false,
+                    priority : -3)
             endforeach
         endif
 

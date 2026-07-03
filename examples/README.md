@@ -1,15 +1,38 @@
 # TraCR examples
 
-The following examples are provided:
+The following examples are provided in `tracr/`. Each one is built twice by
+meson: once with instrumentation enabled (`<name>_tracr_enabled`) and once with
+the zero-cost stubs (`<name>_tracr_disabled`).
 
-- `thread_markers.*`: This is the most commonly used example. The so-called thread markers are stored on the main thread.
-If your application uses multiple threads (e.g., with Pthreads), see `pthread_example.*`.
+- `simple.cpp`: The best starting point. A single-threaded matrix
+multiplication where every phase (allocate, fill, MMM, print, free) is wrapped
+in a marker registered with `INSTRUMENTATION_MARK_W_COLOR_ADD()`. All events
+live on one channel of the main thread; the `extraId` field is used to attach
+extra information (the matrix size) to an event.
 
-- `pthread_example.*`: Similar to `thread_markers.*`, but runs across multiple threads using Pthreads.
-In this case, threads must be explicitly initialized.
+- `pthread.cpp`: Multi-threaded tracing with Pthreads. Every worker thread
+calls `INSTRUMENTATION_THREAD_INIT()` / `INSTRUMENTATION_THREAD_FINALIZE()`
+itself and marks its tasks on its own channel (channel id = thread id), so
+each thread shows up as its own lane in the viewer. Also shows lazy marker
+registration (`INSTRUMENTATION_MARK_ADD()`, no explicit color) and custom
+channel names via `INSTRUMENTATION_ADD_CHANNEL_NAMES()`.
 
-- `vmarkers_push_pop.*`: Equivalent to `thread_markers.*`, but uses VMARKS (short for vanilla markers).
-These are lightweight markers that are pushed using a color ID instead of a marker ID. Useful when working with many different markers.
+- `performance_test.cpp`: Measures TraCR's hot-path overhead by issuing 1000
+`INSTRUMENTATION_MARK_SET()` / `INSTRUMENTATION_MARK_RESET()` pairs in a tight
+loop and printing the average cost per marker.
 
-- `vmarkers_set.*`: Another VMARKS example, this time using the SET method instead of PUSH/POP.
-The PUSH/POP method relies on each marker being explicitly pushed and later popped, whereas the SET method simply sets the marker without requiring an end point (i.e. a pop).
+## Simulated multiproc runs (no MPI required)
+
+Any instrumented example can be run in "multiproc mode" by simply launching it
+several times concurrently from the same working directory — each process
+writes its own `proc.<pid>/` folder into the shared `tracr/` directory, exactly
+like N MPI ranks on one node would. The `multiproc_run.sh` helper does this:
+
+```bash
+cd <some-workdir>
+../bash_scripts/multiproc_run.sh 4 ./simple_tracr_enabled
+tracr_process tracr/ perfetto   # one process per pid in the merged view
+```
+
+The meson test suite runs every example this way (4 concurrent instances) and
+postprocesses the merged trace in all formats.
