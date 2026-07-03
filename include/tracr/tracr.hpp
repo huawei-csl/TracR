@@ -101,6 +101,15 @@ enum mark_color : uint16_t {
 #define INSTRUMENTATION_MARK_RESET(channelId)                                  \
   instrumentation_mark_reset(channelId)
 
+/**
+ * Flow methods (draw an arrow between two events, e.g. send -> recv)
+ */
+#define INSTRUMENTATION_FLOW_START(channelId, flowId)                          \
+  instrumentation_flow_start(channelId, flowId)
+
+#define INSTRUMENTATION_FLOW_END(channelId, flowId)                            \
+  instrumentation_flow_end(channelId, flowId)
+
 #define INSTRUMENTATION_ADD_CHANNEL_NAMES(channel_names)                       \
   tracrProc->addCustomChannelNames(channel_names)
 
@@ -165,6 +174,17 @@ enum mark_color : uint16_t {
   (void)(extraId)
 
 #define INSTRUMENTATION_MARK_RESET(channelId) (void)(channelId)
+
+/**
+ * Flow methods
+ */
+#define INSTRUMENTATION_FLOW_START(channelId, flowId)                          \
+  (void)(channelId);                                                           \
+  (void)(flowId)
+
+#define INSTRUMENTATION_FLOW_END(channelId, flowId)                            \
+  (void)(channelId);                                                           \
+  (void)(flowId)
 
 #define INSTRUMENTATION_ADD_CHANNEL_NAMES(channel_names) (void)(channel_names)
 

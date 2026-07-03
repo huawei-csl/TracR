@@ -110,6 +110,21 @@ INSTRUMENTATION_MARK_RESET(channelId)                   // end the event on this
 
 `channelId` is the visualization lane (0-based). `extraId` is an optional user tag (e.g. task index); use `UINT32_MAX` for none.
 
+### Flow events (arrows between events)
+
+```cpp
+INSTRUMENTATION_FLOW_START(channelId, flowId)   // arrow leaves the currently open event
+INSTRUMENTATION_FLOW_END(channelId, flowId)     // arrow arrives at the currently open event
+```
+
+A flow connects two traced events with an arrow — across channels, threads, or procs. The classic use case is message passing: `FLOW_START` next to an `MPI_Send()` and `FLOW_END` next to the matching `MPI_Recv()` draws the message path in the merged multi-proc view.
+
+Rules:
+
+- Both endpoints must use the **same `flowId`**, and a `flowId` must be **unique within the whole trace**. For MPI, derive it from values both sides know — e.g. `(src_rank, tag, sequence number)` — or transmit it inside the message itself (see `examples/tracr/flow.cpp`).
+- Call flow macros while an event is **open** on that channel (between `MARK_SET` and the closing reset/set): the arrow attaches to the enclosing event.
+- In Perfetto these become flow events (`ph:"s"` / `ph:"f"`); in Paraver they become communication records (the yellow send/recv lines).
+
 ### Channel metadata
 
 ```cpp
