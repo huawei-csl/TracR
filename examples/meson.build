@@ -6,7 +6,7 @@ multiproc_script = find_program('bash_scripts/multiproc_run.sh', native: true, r
 # Number of concurrent instances used to simulate a multiproc (MPI-like) run
 multiproc_num_procs = '4'
 
-test_types = ['simple', 'pthread', 'performance_test']
+test_types = ['simple', 'pthread', 'performance_test', 'flow', 'flow_alltoall']
 
 cpp_args_list = [
     ['-DENABLE_TRACR', '-DENABLE_DEBUG'], # Enable TraCR

@@ -518,6 +518,13 @@ int create_tracr_prv(const fs::path &base_path,
     std::string colorId;
   };
 
+  // One side of a flow (task/thread + normalized time), keyed by flow id
+  struct FlowEndpoint {
+    uint64_t timestamp;
+    uint32_t task;
+    uint32_t thread;
+  };
+
   size_t tot_num_traces = 0;
   for (const auto &proc : procs)
     for (const auto &traces : proc.bts_files)
@@ -525,6 +532,9 @@ int create_tracr_prv(const fs::path &base_path,
 
   std::vector<PrvRecord> records;
   records.reserve(tot_num_traces);
+
+  std::unordered_map<uint32_t, std::vector<FlowEndpoint>> flow_starts;
+  std::unordered_map<uint32_t, std::vector<FlowEndpoint>> flow_ends;
 
   for (size_t p = 0; p < procs.size(); ++p) {
     const ProcData &proc = procs[p];
@@ -536,14 +546,26 @@ int create_tracr_prv(const fs::path &base_path,
     while (!merger.empty()) {
       auto [payload, index] = merger.next();
 
+      // Flow payloads become communication records, not event records
+      if (payload.eventId == TraCR::EVENTID_FLOW_START ||
+          payload.eventId == TraCR::EVENTID_FLOW_END) {
+        auto &endpoints = (payload.eventId == TraCR::EVENTID_FLOW_START)
+                              ? flow_starts[payload.extraId]
+                              : flow_ends[payload.extraId];
+        endpoints.push_back({payload.timestamp - proc.sync_start,
+                             static_cast<uint32_t>(p + 1),
+                             static_cast<uint32_t>(payload.channelId) + 1});
+        continue;
+      }
+
       std::string colorId;
 
       if (!markerColorIds.empty()) {
-        colorId = (payload.eventId == UINT16_MAX)
+        colorId = (payload.eventId == TraCR::EVENTID_RESET)
                       ? "0"
                       : markerColorIds[payload.eventId];
       } else {
-        colorId = (payload.eventId == UINT16_MAX)
+        colorId = (payload.eventId == TraCR::EVENTID_RESET)
                       ? "0"
                       : std::to_string(payload.eventId);
       }
@@ -560,10 +582,75 @@ int create_tracr_prv(const fs::path &base_path,
                      return a.timestamp < b.timestamp;
                    });
 
+  // Pair flow starts with flow ends (per flow id, in time order) into Paraver
+  // communication records: 3:obj_send:lsend:psend:obj_recv:lrecv:precv:size:tag
+  struct CommRecord {
+    FlowEndpoint send;
+    FlowEndpoint recv;
+    uint32_t flowId;
+  };
+  std::vector<CommRecord> comms;
+  size_t unmatched = 0;
+
+  for (auto &[flowId, starts] : flow_starts) {
+    auto ends_it = flow_ends.find(flowId);
+    std::vector<FlowEndpoint> *ends =
+        (ends_it != flow_ends.end()) ? &ends_it->second : nullptr;
+
+    auto by_time = [](const FlowEndpoint &a, const FlowEndpoint &b) {
+      return a.timestamp < b.timestamp;
+    };
+    std::sort(starts.begin(), starts.end(), by_time);
+    size_t num_pairs = 0;
+    if (ends) {
+      std::sort(ends->begin(), ends->end(), by_time);
+      num_pairs = std::min(starts.size(), ends->size());
+      for (size_t i = 0; i < num_pairs; ++i)
+        comms.push_back({starts[i], (*ends)[i], flowId});
+      unmatched += ends->size() - num_pairs;
+    }
+    unmatched += starts.size() - num_pairs;
+  }
+  for (const auto &[flowId, ends] : flow_ends)
+    if (!flow_starts.count(flowId))
+      unmatched += ends.size();
+
+  if (unmatched > 0)
+    std::cout << "WARNING: " << unmatched
+              << " flow endpoint(s) without a matching counterpart were "
+                 "dropped.\n";
+
+  std::sort(comms.begin(), comms.end(),
+            [](const CommRecord &a, const CommRecord &b) {
+              return a.send.timestamp < b.send.timestamp;
+            });
+
+  // Interleave event and communication records by time
+  size_t c = 0;
   for (const auto &record : records) {
+    while (c < comms.size() && comms[c].send.timestamp <= record.timestamp) {
+      const CommRecord &comm = comms[c++];
+      out << "3:0:1:" << comm.send.task << ":" << comm.send.thread << ":"
+          << comm.send.timestamp << ":" << comm.send.timestamp
+          << ":0:1:" << comm.recv.task << ":" << comm.recv.thread << ":"
+          << comm.recv.timestamp << ":" << comm.recv.timestamp
+          << ":1:" << comm.flowId << "\n";
+    }
     out << "2:0:1:" << record.task << ":" << record.thread << ":"
         << record.timestamp << ":90:" << record.colorId << "\n";
   }
+  for (; c < comms.size(); ++c) {
+    const CommRecord &comm = comms[c];
+    out << "3:0:1:" << comm.send.task << ":" << comm.send.thread << ":"
+        << comm.send.timestamp << ":" << comm.send.timestamp
+        << ":0:1:" << comm.recv.task << ":" << comm.recv.thread << ":"
+        << comm.recv.timestamp << ":" << comm.recv.timestamp
+        << ":1:" << comm.flowId << "\n";
+  }
+
+  if (!comms.empty())
+    std::cout << "Wrote " << comms.size() << " communication record(s) from "
+              << "flow events.\n";
 
   out.close();
   std::cout << "tracr.prv written successfully.\n";
@@ -645,12 +732,20 @@ void validate_last_events_for_perfetto(
     const std::vector<pid_t> &bts_tids) {
   for (size_t i = 0; i < bts_files.size(); ++i) {
 
-    if (bts_files[i].empty())
+    // Trailing flow payloads don't open events; look for the last payload
+    // that changes the channel state (a set or a reset).
+    size_t last = bts_files[i].size();
+    while (last > 0 &&
+           (bts_files[i][last - 1].eventId == TraCR::EVENTID_FLOW_START ||
+            bts_files[i][last - 1].eventId == TraCR::EVENTID_FLOW_END))
+      --last;
+
+    if (last == 0)
       continue;
 
-    const TraCR::Payload &payload = bts_files[i].back();
+    const TraCR::Payload &payload = bts_files[i][last - 1];
 
-    if (payload.eventId != UINT16_MAX) {
+    if (payload.eventId != TraCR::EVENTID_RESET) {
       std::cout
           << "WARNING: the last event got lost of this thread: " << bts_tids[i]
           << ". To not loose this last event add INSTRUMENTATION_MARK_RESET() "
@@ -744,7 +839,7 @@ int perfetto(const std::vector<ProcData> &procs, const fs::path base_path) {
     // Merge the proc's thread buffers in timestamp order and emit complete
     // events (ph=X)
     std::vector<TraCR::Payload> prev_payloads(
-        num_channels, TraCR::Payload{0, UINT16_MAX, UINT32_MAX, 0});
+        num_channels, TraCR::Payload{0, TraCR::EVENTID_RESET, UINT32_MAX, 0});
 
     PayloadMerger merger(proc.bts_files);
     while (!merger.empty()) {
@@ -757,7 +852,21 @@ int perfetto(const std::vector<ProcData> &procs, const fs::path base_path) {
         return 1;
       }
 
-      if (prev_payloads[channelId].eventId != UINT16_MAX) {
+      // Flow payloads draw an arrow between the enclosing slices of both
+      // endpoints (ph=s at the source, ph=f at the destination). They do not
+      // open or close events, so the slice state machine is left untouched.
+      if (payload.eventId == TraCR::EVENTID_FLOW_START ||
+          payload.eventId == TraCR::EVENTID_FLOW_END) {
+        const bool is_start = (payload.eventId == TraCR::EVENTID_FLOW_START);
+        out << ",\n{\"name\":\"flow\",\"cat\":\"flow\",\"ph\":"
+            << (is_start ? "\"s\"" : "\"f\",\"bp\":\"e\"")
+            << ",\"id\":" << payload.extraId
+            << ",\"ts\":" << fmt_us(payload.timestamp - proc.sync_start)
+            << ",\"pid\":" << pid << ",\"tid\":" << (channelId + 1) << "}";
+        continue;
+      }
+
+      if (prev_payloads[channelId].eventId != TraCR::EVENTID_RESET) {
         const TraCR::Payload &prev = prev_payloads[channelId];
         std::string mType = (!markerLabels.empty())
                                 ? markerLabels[prev.eventId]
@@ -814,12 +923,25 @@ int dump_info(const std::vector<ProcData> &procs) {
     while (!merger.empty()) {
       auto [payload, index] = merger.next();
 
+      // Flow payloads don't open/close events: print and skip the checks
+      if (payload.eventId == TraCR::EVENTID_FLOW_START ||
+          payload.eventId == TraCR::EVENTID_FLOW_END) {
+        std::cout << "Thread[" << proc.bts_tids[index] << "]: ["
+                  << payload.channelId << ", "
+                  << ((payload.eventId == TraCR::EVENTID_FLOW_START)
+                          ? "FLOW_START"
+                          : "FLOW_END")
+                  << ", id=" << payload.extraId << ", " << payload.timestamp
+                  << "]\n";
+        continue;
+      }
+
       std::cout << "Thread[" << proc.bts_tids[index] << "]: ["
                 << payload.channelId << ", " << payload.eventId << ", "
                 << payload.extraId << ", " << payload.timestamp << "]\n";
 
       int32_t &counter = channelIds_check[payload.channelId];
-      if (payload.eventId == UINT16_MAX) {
+      if (payload.eventId == TraCR::EVENTID_RESET) {
         --counter;
       } else {
         ++counter;

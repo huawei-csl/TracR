@@ -21,6 +21,21 @@ channel names via `INSTRUMENTATION_ADD_CHANNEL_NAMES()`.
 `INSTRUMENTATION_MARK_SET()` / `INSTRUMENTATION_MARK_RESET()` pairs in a tight
 loop and printing the average cost per marker.
 
+- `flow.cpp`: Flow events across two procs — the `MPI_Send()` -> `MPI_Recv()`
+pattern simulated with `fork()` and a pipe, so no MPI is needed. The sender
+wraps each message in a marker and calls `INSTRUMENTATION_FLOW_START()`, the
+receiver answers with `INSTRUMENTATION_FLOW_END()`; the merged trace shows an
+arrow per message from the send slice to the recv slice (flow events in
+Perfetto, communication records in Paraver). The flow id travels inside the
+message itself, like an MPI tag.
+
+- `flow_alltoall.cpp`: A simulated `MPI_Alltoall` built from flow events. N
+ranks are modelled as N channels of one proc; every rank sends a block to every
+rank, giving N*N arrows in the full crossing pattern. Shows the essential flow
+rule — a unique id per message shared by both endpoints — by deriving the id of
+message `src -> dst` as `src * N + dst`, so the send's `FLOW_START` matches the
+recv's `FLOW_END`.
+
 ## Simulated multiproc runs (no MPI required)
 
 Any instrumented example can be run in "multiproc mode" by simply launching it

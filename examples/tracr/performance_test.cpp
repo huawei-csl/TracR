@@ -37,7 +37,7 @@ int main(void) {
   std::chrono::duration<double> perf_time = (perf_test_stop - perf_test_start);
 
   printf("Setting %d markers costs: %f[ms] and on average: %f[ns]\n",
-         2 * n_sets, perf_time.count() * 1e6,
+         2 * n_sets, perf_time.count() * 1e3,
          perf_time.count() * 1e9 / double(2 * n_sets));
 
   // TraCR finished

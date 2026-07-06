@@ -179,6 +179,19 @@ struct Payload {
 static_assert(sizeof(Payload) == 16, "Payload must be exactly 16 bytes");
 
 /**
+ * Reserved eventId values at the top of the uint16_t range. Marker
+ * registration hands out eventIds growing upwards from 0 and must stay below
+ * EVENTID_RESERVED_MIN.
+ */
+// Closes the currently open event on a channel
+constexpr uint16_t EVENTID_RESET = UINT16_MAX;
+// Flow arrow source / destination (the extraId field carries the flow id)
+constexpr uint16_t EVENTID_FLOW_START = UINT16_MAX - 1;
+constexpr uint16_t EVENTID_FLOW_END = UINT16_MAX - 2;
+// Lowest reserved eventId
+constexpr uint16_t EVENTID_RESERVED_MIN = EVENTID_FLOW_END;
+
+/**
  * TraCR Thread class. One MPI instance has at least 1
  */
 class TraCRThread {

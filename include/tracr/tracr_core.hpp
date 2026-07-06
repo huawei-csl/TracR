@@ -239,6 +239,12 @@ static inline std::string instrumentation_get_thread_trace_str() {
  */
 static inline uint16_t
 instrumentation_mark_w_color_add(const std::string &label, uint16_t colorId) {
+  if (tracrProc->_markerLabels.size() >= EVENTID_RESERVED_MIN) {
+    std::cerr << "Cannot register more markers: eventIds "
+              << EVENTID_RESERVED_MIN << " and above are reserved.\n";
+    std::exit(EXIT_FAILURE);
+  }
+
   if (tracrProc->_markerTypes.count(colorId)) {
     std::cerr << "This color has already been used. Choose another one.\n";
     std::exit(EXIT_FAILURE);
@@ -261,6 +267,12 @@ instrumentation_mark_w_color_add(const std::string &label, uint16_t colorId) {
  * @return the eventId of this marker
  */
 static inline uint16_t instrumentation_mark_add(const std::string &label) {
+  if (tracrProc->_markerLabels.size() >= EVENTID_RESERVED_MIN) {
+    std::cerr << "Cannot register more markers: eventIds "
+              << EVENTID_RESERVED_MIN << " and above are reserved.\n";
+    std::exit(EXIT_FAILURE);
+  }
+
   uint16_t colorId = lazy_colorId.fetch_add(1);
   if (tracrProc->_markerTypes.count(colorId)) {
     std::cerr << "This color has already been used. Choose another one.\n";
@@ -295,7 +307,42 @@ static inline void instrumentation_mark_reset(uint16_t channelId) {
   if (TRACR_UNLIKELY(!enable_tracr))
     return;
 
-  Payload payload{channelId, UINT16_MAX, UINT32_MAX, NanoTimer::now()};
+  Payload payload{channelId, EVENTID_RESET, UINT32_MAX, NanoTimer::now()};
+
+  tracrThread->store_trace(payload);
+}
+
+/**
+ * Flow events: draw an arrow between two traced events, e.g. from an
+ * MPI_Send() on one proc to the matching MPI_Recv() on another (or between
+ * two threads/channels of the same proc).
+ *
+ * Both endpoints must use the same flowId, and a flowId must be unique within
+ * the whole trace. For MPI, derive it from values both sides know, e.g.
+ * (src_rank, tag, sequence number), or transmit it inside the message itself.
+ *
+ * Flow events attach to the event currently open on the channel, so call them
+ * between INSTRUMENTATION_MARK_SET() and the closing reset/set.
+ */
+static inline void instrumentation_flow_start(uint16_t channelId,
+                                              uint32_t flowId) {
+  if (TRACR_UNLIKELY(!enable_tracr))
+    return;
+
+  Payload payload{channelId, EVENTID_FLOW_START, flowId, NanoTimer::now()};
+
+  tracrThread->store_trace(payload);
+}
+
+/**
+ * See instrumentation_flow_start()
+ */
+static inline void instrumentation_flow_end(uint16_t channelId,
+                                            uint32_t flowId) {
+  if (TRACR_UNLIKELY(!enable_tracr))
+    return;
+
+  Payload payload{channelId, EVENTID_FLOW_END, flowId, NanoTimer::now()};
 
   tracrThread->store_trace(payload);
 }
