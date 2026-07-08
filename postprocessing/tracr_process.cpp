@@ -495,6 +495,16 @@ int create_tracr_prv(const fs::path &base_path,
     return 1;
   }
 
+  // Total visualized time (ftime): the Paraver timeline spans the whole
+  // profiling session, from INSTRUMENTATION_START() (= t0 of every proc) to
+  // the latest INSTRUMENTATION_END() across all procs. For traces recorded
+  // without the end_time anchor, sync_end fell back to the last payload, so
+  // the timeline then ends at the last recorded marker instead.
+  uint64_t total_time = 0;
+  for (const auto &proc : procs)
+    if (proc.sync_end > proc.sync_start)
+      total_time = std::max(total_time, proc.sync_end - proc.sync_start);
+
   auto now = std::chrono::system_clock::now();
   std::time_t now_time = std::chrono::system_clock::to_time_t(now);
   std::tm *local_tm = std::localtime(&now_time);
@@ -504,7 +514,7 @@ int create_tracr_prv(const fs::path &base_path,
       << "/" << std::setw(2) << std::setfill('0') << (local_tm->tm_year % 100)
       << " at " << std::setw(2) << std::setfill('0') << local_tm->tm_hour << ":"
       << std::setw(2) << std::setfill('0') << local_tm->tm_min
-      << "):00000000000000000000_ns:0:1:" << procs.size() << "(";
+      << "):" << total_time << "_ns:0:1:" << procs.size() << "(";
 
   for (size_t p = 0; p < procs.size(); ++p)
     out << proc_channels[p] << ":1" << (p + 1 < procs.size() ? "," : "");
