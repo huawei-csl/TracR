@@ -495,15 +495,29 @@ int create_tracr_prv(const fs::path &base_path,
     return 1;
   }
 
-  // Total visualized time (ftime): the Paraver timeline spans the whole
-  // profiling session, from INSTRUMENTATION_START() (= t0 of every proc) to
-  // the latest INSTRUMENTATION_END() across all procs. For traces recorded
+  // The visible timeline starts at the first recorded payload across all
+  // procs: one constant shift applied to every record, so the cross-proc
+  // alignment (per-proc start_time anchors) is preserved while the leading
+  // uninstrumented startup phase (between INSTRUMENTATION_START() and the
+  // first marker) is cut off.
+  uint64_t global_t0 = UINT64_MAX;
+  for (const auto &proc : procs)
+    for (const auto &traces : proc.bts_files)
+      if (!traces.empty())
+        global_t0 =
+            std::min(global_t0, traces.front().timestamp - proc.sync_start);
+  if (global_t0 == UINT64_MAX)
+    global_t0 = 0;
+
+  // Total visualized time (ftime): from the first recorded payload to the
+  // latest INSTRUMENTATION_END() across all procs. For traces recorded
   // without the end_time anchor, sync_end fell back to the last payload, so
   // the timeline then ends at the last recorded marker instead.
   uint64_t total_time = 0;
   for (const auto &proc : procs)
     if (proc.sync_end > proc.sync_start)
       total_time = std::max(total_time, proc.sync_end - proc.sync_start);
+  total_time = (total_time > global_t0) ? total_time - global_t0 : 0;
 
   auto now = std::chrono::system_clock::now();
   std::time_t now_time = std::chrono::system_clock::to_time_t(now);
@@ -562,7 +576,7 @@ int create_tracr_prv(const fs::path &base_path,
         auto &endpoints = (payload.eventId == TraCR::EVENTID_FLOW_START)
                               ? flow_starts[payload.extraId]
                               : flow_ends[payload.extraId];
-        endpoints.push_back({payload.timestamp - proc.sync_start,
+        endpoints.push_back({payload.timestamp - proc.sync_start - global_t0,
                              static_cast<uint32_t>(p + 1),
                              static_cast<uint32_t>(payload.channelId) + 1});
         continue;
@@ -580,9 +594,10 @@ int create_tracr_prv(const fs::path &base_path,
                       : std::to_string(payload.eventId);
       }
 
-      records.push_back(
-          {payload.timestamp - proc.sync_start, static_cast<uint32_t>(p + 1),
-           static_cast<uint32_t>(payload.channelId) + 1, std::move(colorId)});
+      records.push_back({payload.timestamp - proc.sync_start - global_t0,
+                         static_cast<uint32_t>(p + 1),
+                         static_cast<uint32_t>(payload.channelId) + 1,
+                         std::move(colorId)});
     }
   }
 
@@ -927,11 +942,17 @@ int dump_info(const std::vector<ProcData> &procs) {
     std::unordered_map<uint16_t, int32_t> channelIds_check;
     std::unordered_map<uint16_t, std::unordered_set<uint32_t>> extraIds_check;
 
+    // Histogram of eventIds, ordered for the summary at the end. Downstream
+    // scripts parse this block, so its format is stable.
+    std::map<uint16_t, uint64_t> event_counts;
+
     std::cout << "Thread[x]: [channelId, eventId, extraId, timestamp]\n";
 
     PayloadMerger merger(proc.bts_files);
     while (!merger.empty()) {
       auto [payload, index] = merger.next();
+
+      ++event_counts[payload.eventId];
 
       // Flow payloads don't open/close events: print and skip the checks
       if (payload.eventId == TraCR::EVENTID_FLOW_START ||
@@ -985,6 +1006,12 @@ int dump_info(const std::vector<ProcData> &procs) {
         }
         std::cout << "}\n";
       }
+    }
+
+    std::cout << "\nThe different event types and their counts: [eventId, "
+                 "count]\n";
+    for (const auto &[eventId, count] : event_counts) {
+      std::cout << "[" << eventId << ", " << count << "]\n";
     }
     std::cout << "\n";
   }

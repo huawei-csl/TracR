@@ -210,7 +210,7 @@ Produces `perfetto.json`. Load it at [ui.perfetto.dev](https://ui.perfetto.dev).
 
 ### Paraver
 
-Produces `tracr.prv`, `tracr.pcf`, and `tracr.row`. Each proc becomes one Paraver task, each channel one thread within its task. The trace duration in the header spans the full profiling session — from `INSTRUMENTATION_START()` (t=0) to the latest `INSTRUMENTATION_END()` across all procs; traces recorded by older library versions without the `end_time` anchor end at the last recorded marker instead. Requires a `state.cfg` in the working directory (copied automatically from `postprocessing/paraver/state.cfg` during build).
+Produces `tracr.prv`, `tracr.pcf`, and `tracr.row`. Each proc becomes one Paraver task, each channel one thread within its task. The timeline starts at the first recorded event across all procs (t=0, one constant shift that preserves the cross-proc alignment) and ends at the latest `INSTRUMENTATION_END()`; traces recorded by older library versions without the `end_time` anchor end at the last recorded marker instead. Requires a `state.cfg` in the working directory (copied automatically from `postprocessing/paraver/state.cfg` during build).
 
 ### Dump
 
