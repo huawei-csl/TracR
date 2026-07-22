@@ -79,3 +79,41 @@ foreach args : cpp_args_list
             priority : 1)
     endforeach
 endforeach
+
+####### PyTraCR examples (need the tracr Python module built)
+
+if get_option('buildPyTraCR')
+    pytracr_examples = ['simple', 'threads', 'flow']
+
+    foreach ex : pytracr_examples
+        test_name = 'pytracr_' + ex
+        output_dir = meson.current_build_dir() / (test_name + '.p')
+
+        # Meson only auto-creates the private dirs of compiled targets, so
+        # the working directories of the Python examples are made at setup
+        run_command('mkdir', '-p', output_dir, check: true)
+
+        test('cleanup_script_' + test_name, cleanup_script,
+                workdir: output_dir,
+                suite : testSuite,
+                is_parallel : false,
+                priority : 2)
+
+        test(test_name, py,
+            args : [files('pytracr' / ex + '.py')],
+            env : ['PYTHONPATH=' + pytracr_build_dir],
+            workdir: output_dir,
+            suite : testSuite,
+            is_parallel : false,
+            priority : 1)
+
+        foreach format : ['paraver', 'perfetto', 'dump']
+            test('tracr_process_' + format + '_' + test_name, tracr_process,
+                workdir: meson.current_build_dir() / '../postprocessing',
+                args : [ output_dir / 'tracr', format],
+                suite : testSuite,
+                is_parallel : false,
+                priority : 0)
+        endforeach
+    endforeach
+endif

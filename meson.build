@@ -36,6 +36,12 @@ InstrumentationBuildDep = declare_dependency(
 
 subdir('postprocessing')
 
+####### Build PyTraCR (Python bindings)
+
+if get_option('buildPyTraCR')
+  subdir('include/pytracr')
+endif
+
 ####### Build test / example targets only if this repo is being loaded not as a subproject
 
 if meson.is_subproject() == false

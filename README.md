@@ -46,6 +46,7 @@ cd build && ninja
 |---|---|---|
 | `buildExamples` | `false` | Build the example programs |
 | `buildTests` | `false` | Build the test suite |
+| `buildPyTraCR` | `false` | Build the Python bindings (requires pybind11) |
 | `compileWarningsAsErrors` | `false` | Treat warnings as errors (for CI) |
 
 ```bash
@@ -186,6 +187,39 @@ void* worker(void* arg) {
 ```
 
 See [examples/tracr/](examples/tracr/) for complete examples including pthreads and a performance benchmark.
+
+---
+
+## PyTraCR (Python bindings)
+
+The full TraCR API is also available from Python as the `tracr` module, built with [pybind11](https://github.com/pybind/pybind11):
+
+```bash
+pip install pybind11        # or: sudo apt install pybind11-dev
+meson setup build -DbuildPyTraCR=true
+ninja -C build
+PYTHONPATH=build/include/pytracr python3 my_script.py
+```
+
+The Python API mirrors the C++ macros one-to-one:
+
+```python
+from tracr import *
+
+INSTRUMENTATION_START()
+
+work_id = INSTRUMENTATION_MARK_W_COLOR_ADD("work", mark_color.MARK_COLOR_TEAL)
+
+INSTRUMENTATION_MARK_SET(0, work_id)     # extraId is optional
+# ... do work ...
+INSTRUMENTATION_MARK_RESET(0)
+
+INSTRUMENTATION_ADD_CHANNEL_NAMES(["main"])   # plain list of str
+
+INSTRUMENTATION_END()
+```
+
+Python threads are real OS threads, so multithreaded tracing works exactly like in C++ (`INSTRUMENTATION_THREAD_INIT()` / `INSTRUMENTATION_THREAD_FINALIZE()` in each non-main thread). See [include/pytracr/README.md](include/pytracr/README.md) and [examples/pytracr/](examples/pytracr/) for details.
 
 ---
 

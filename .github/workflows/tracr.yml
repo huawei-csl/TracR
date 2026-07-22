@@ -20,13 +20,13 @@ jobs:
       run: sudo apt update
     - name: Install build dependencies
       run: sudo apt install -y build-essential
-    - name: Install meson, ninja and gcovr
-      run: python3 -m pip install meson ninja gcovr
+    - name: Install meson, ninja, gcovr and pybind11
+      run: python3 -m pip install meson ninja gcovr pybind11
     - name: Update submodules
       run: git submodule update --init --recursive
     - name: Build
       run: |
-        meson setup build -DbuildExamples=true -DbuildTests=true -DcompileWarningsAsErrors=true
+        meson setup build -DbuildExamples=true -DbuildTests=true -DbuildPyTraCR=true -DcompileWarningsAsErrors=true
         meson compile -C build
     - name: Run tests
       run: meson test -C build
