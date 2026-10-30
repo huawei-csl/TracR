@@ -244,11 +244,11 @@ After running your instrumented binary, convert the `.bts` files with `tracr_pro
 
 ### Perfetto
 
-Produces `perfetto.json`. Load it at [ui.perfetto.dev](https://ui.perfetto.dev). Each proc becomes its own process, each channel a named track within it; event durations are reconstructed from SET/RESET pairs. Timestamps are written as floating-point microseconds (e.g. a 1500 ns event → `1.5 µs`) to preserve sub-microsecond precision within Perfetto's native time unit.
+Produces `perfetto.json`. Load it at [ui.perfetto.dev](https://ui.perfetto.dev). Each proc becomes its own process, each channel a named track within it.
 
 ### Paraver
 
-Produces `tracr.prv`, `tracr.pcf`, and `tracr.row`. Each proc becomes one Paraver task, each channel one thread within its task. The timeline starts at the first recorded event across all procs (t=0, one constant shift that preserves the cross-proc alignment) and ends at the latest `INSTRUMENTATION_END()`; traces recorded by older library versions without the `end_time` anchor end at the last recorded marker instead. Requires a `state.cfg` in the working directory (copied automatically from `postprocessing/paraver/state.cfg` during build).
+Produces `tracr.prv`, `tracr.pcf`, and `tracr.row`. Each proc becomes one Paraver task, each channel one thread within its task. Requires a `state.cfg` in the working directory (copied automatically from `postprocessing/paraver/state.cfg` during build).
 
 ### Dump
 
@@ -256,7 +256,7 @@ Prints all payloads chronologically (per proc) and reports any channels with mis
 
 ### Multi-proc traces and synchronization
 
-`tracr_process` accepts a `tracr/` folder containing any number of `proc.<pid>/` subfolders — for example one per MPI rank writing to the same trace path. TraCR itself has no MPI dependency: a multiproc trace is simply produced by several instrumented processes running with the same trace path. You can simulate this without MPI via `examples/bash_scripts/multiproc_run.sh <num_procs> <executable>`, which launches N concurrent instances of a binary (the test suite does this for every example). `metadata.json` stores two synchronization anchors, `start_time` (taken at `INSTRUMENTATION_START()`) and `end_time` (taken when the trace is dumped at `INSTRUMENTATION_END()`), in the same clock domain as the payload timestamps. The postprocessor normalizes every proc's timestamps to its own `start_time`, which aligns procs under the assumption that they all pass `INSTRUMENTATION_START()` at the same real instant (e.g. right after a blocking collective such as `MPI_Init`). Traces recorded by older library versions fall back to the earliest/latest payload timestamp per proc.
+`tracr_process` accepts a `tracr/` folder containing any number of `proc.<pid>/` subfolders — for example one per MPI rank writing to the same trace path. TraCR itself has no MPI dependency; `examples/bash_scripts/multiproc_run.sh <num_procs> <executable>` launches N concurrent instances of a binary to simulate this (the test suite does so for every example). Each proc's timestamps are normalized to its own `start_time` (taken at `INSTRUMENTATION_START()`), so procs line up if they all pass `INSTRUMENTATION_START()` at the same real instant — e.g. right after a blocking collective such as `MPI_Init`.
 
 ---
 
@@ -279,8 +279,7 @@ Buffer memory per thread: `TRACR_CAPACITY × 16 bytes` (default ≈ 17 MB).
 
 ## Supported architectures
 
-- **x86_64** — `clock_gettime(CLOCK_MONOTONIC_RAW)` or TSC (`USE_HW_COUNTER`)
-- **AArch64** — `clock_gettime(CLOCK_MONOTONIC_RAW)` or `cntvct_el0` (`USE_HW_COUNTER`)
+- **x86_64** and **AArch64** (Linux) — `clock_gettime(CLOCK_MONOTONIC_RAW)` by default, hardware counter with `USE_HW_COUNTER`
 
 ---
 
