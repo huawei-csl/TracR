@@ -2,6 +2,10 @@
 
 **TraCR** (pronounced *tracer*) is a lightweight, nanoscale instrumentation library for tracing multi-threaded C++ applications. It is designed for minimal overhead on the hot path and can be toggled entirely at compile time, leaving zero-cost stubs when disabled.
 
+![Collective communication across four Ascend NPU devices, traced with TraCR and shown in Perfetto](images/Simpler_L3_TraCR.png)
+
+*A collective communication across four Ascend NPU devices (Simpler L3 profiling), traced with TraCR and viewed in Perfetto.*
+
 ## How it works
 
 Instrumentation calls store fixed-size `Payload` records (16 bytes each) into a per-thread ring buffer:
